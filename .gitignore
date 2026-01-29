@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env (do not push)
+backend/.venv/
+.venv/
+
+# Secrets & local env files
+backend/.env
+.env
+backend/.streamlit/secrets.toml
+.streamlit/secrets.toml
+
+# Streamlit local storage
+backend/storage/
+storage/
+
+# Local booking store (optional)
+backend/data/booking_requests.jsonl
+backend/data/booking_requests.jsonl*
+
+# OS junk
+.DS_Store
+Thumbs.db
