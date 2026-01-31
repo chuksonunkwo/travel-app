@@ -279,6 +279,9 @@ def save_to_airtable(payload: dict) -> tuple[bool, str]:
         "Content-Type": "application/json",
     }
 
+    passenger_names = payload.get("passenger_names", []) or []
+    passenger_names_flat = ", ".join([n for n in passenger_names if str(n).strip()])[:1000]
+
     fields = {
         "created_at": payload.get("created_at", ""),
         "origin_iata": payload.get("origin", {}).get("iata", ""),
@@ -291,6 +294,8 @@ def save_to_airtable(payload: dict) -> tuple[bool, str]:
         "pax": payload.get("pax", 1),
         "cabin": payload.get("cabin", ""),
         "traveler_name": payload.get("traveler_name", ""),
+        "passenger_names": passenger_names_flat,
+        "booking_whatsapp": payload.get("booking_whatsapp", ""),
         "budget": payload.get("budget", ""),
         "airline_pref": payload.get("airline_pref", ""),
         "flexible_dates": payload.get("flexible_dates", ""),
@@ -318,13 +323,17 @@ def build_handoff_message(payload: dict) -> str:
     depart_date = payload.get("depart_date", "")
     return_date = payload.get("return_date", "")
 
+    pax = payload.get("pax", 1)
+    passenger_names = payload.get("passenger_names", []) or []
+    booking_whatsapp = payload.get("booking_whatsapp", "")
+
     lines = [
         "🛫 *Travel App — Flight Booking Request*",
         "",
         f"📍 *Origin:* {origin.get('city','')} ({origin.get('iata','')})",
         f"🎯 *Destination:* {dest.get('city','')} ({dest.get('iata','')})",
         "",
-        f"🧳 *Passengers:* {payload.get('pax', 1)}",
+        f"🧳 *Passengers:* {pax}",
         f"💺 *Cabin:* {payload.get('cabin','')}",
         f"🔁 *Trip:* {trip_type}",
         f"📅 *Departure:* {depart_date}",
@@ -336,9 +345,15 @@ def build_handoff_message(payload: dict) -> str:
     if flex:
         lines += ["", f"📆 *Flexible:* {flex}"]
 
-    traveler = payload.get("traveler_name", "")
-    if traveler:
-        lines += ["", f"👤 *Traveler:* {traveler}"]
+    if passenger_names:
+        shown = [n for n in passenger_names if str(n).strip()]
+        if shown:
+            lines += ["", "👤 *Passenger names:*"]
+            for i, nm in enumerate(shown, start=1):
+                lines.append(f"   {i}. {nm}")
+
+    if booking_whatsapp:
+        lines += ["", f"📱 *Booking WhatsApp:* {booking_whatsapp}"]
 
     budget = payload.get("budget", "")
     if budget:
@@ -393,15 +408,12 @@ def create_booking_pdf_bytes(booking_payload: dict) -> bytes | None:
         Spacer(1, 12),
     ]
 
-    pax_details = booking_payload.get("passengers_details", [])
+    passenger_names = booking_payload.get("passenger_names", []) or []
     pax_text = ""
-    if pax_details:
-        lines = []
-        for i, pxd in enumerate(pax_details, start=1):
-            nm = pxd.get("name", "") or "-"
-            wa = pxd.get("whatsapp", "") or "-"
-            lines.append(f"{i}. {nm} — {wa}")
-        pax_text = "<br/>".join(lines)
+    if passenger_names:
+        shown = [n for n in passenger_names if str(n).strip()]
+        if shown:
+            pax_text = "<br/>".join([f"{i}. {nm}" for i, nm in enumerate(shown, start=1)])
 
     rows = [
         ["Passengers", str(booking_payload.get("pax", ""))],
@@ -410,10 +422,12 @@ def create_booking_pdf_bytes(booking_payload: dict) -> bytes | None:
         ["Departure", booking_payload.get("depart_date", "")],
         ["Return", booking_payload.get("return_date", "") or "-"],
         ["Flexible", booking_payload.get("flexible_dates", "") or "-"],
+        ["Booking WhatsApp", booking_payload.get("booking_whatsapp", "") or "-"],
+        ["Email (handoff)", booking_payload.get("booking_email", "") or "-"],
         ["Budget", booking_payload.get("budget", "") or "-"],
         ["Airline preference", booking_payload.get("airline_pref", "") or "-"],
         ["Notes", booking_payload.get("notes", "") or "-"],
-        ["Passenger details", pax_text or "-"],
+        ["Passenger names", pax_text or "-"],
         ["Status", booking_payload.get("status", "")],
     ]
 
@@ -443,7 +457,6 @@ def create_booking_pdf_bytes(booking_payload: dict) -> bytes | None:
 # Mock UI assets (no external images to avoid broken logos)
 # =========================
 def airline_badge_svg(code: str) -> str:
-    # simple inline SVG badge; avoids Render/network/CORS failures
     code = (code or "XX")[:2].upper()
     return f"""
     <svg width="44" height="44" viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg">
@@ -462,10 +475,6 @@ def mock_flight_search_results(
     trip_type: str,
     flex_days: int = 0,
 ) -> list[dict]:
-    """
-    Non-breaking placeholder results (no external API).
-    Returns list of "cards".
-    """
     seed = sum(ord(c) for c in (origin_iata + dest_iata)) + int(depart_date.strftime("%Y%m%d")) + pax + flex_days
     base = 180 + (seed % 220)
     cabin_mult = {"Economy": 1.0, "Premium Economy": 1.35, "Business": 2.3, "First": 3.2}.get(cabin, 1.0)
@@ -515,37 +524,38 @@ def load_airports() -> pd.DataFrame:
 # =========================
 def apply_theme(mode: str):
     """
-    System: do nothing (Streamlit follows browser/OS).
+    System: do nothing (Streamlit follows browser/OS), but apply app-level polish CSS.
     Light/Dark: minimal overrides.
     """
-    # baseline UI polish (works for all modes)
     st.markdown(
         """
         <style>
           .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
-          .ow-card {
-            background: rgba(255,255,255,0.95);
-            border: 1px solid rgba(15,23,42,0.08);
-            border-radius: 18px;
-            padding: 18px 18px;
-            box-shadow: 0 8px 24px rgba(2,6,23,0.06);
-          }
+
           .ow-muted { color: rgba(15,23,42,0.65); }
+
           .ow-hero {
             background: linear-gradient(135deg, rgba(59,130,246,0.10), rgba(16,185,129,0.08));
-            border: 1px solid rgba(15,23,42,0.08);
+            border: 1px solid rgba(15,23,42,0.10);
             border-radius: 22px;
             padding: 22px 22px;
           }
+          .ow-hero h1 { margin:0; color: #0f172a; }
+          .ow-hero .ow-muted { color: rgba(15,23,42,0.70); }
+
           .ow-flight {
             background: #FFFFFF;
-            border: 1px solid rgba(15,23,42,0.08);
+            border: 1px solid rgba(15,23,42,0.10);
             border-radius: 16px;
             padding: 14px 14px;
             margin: 10px 0;
             box-shadow: 0 8px 20px rgba(2,6,23,0.05);
           }
-          .ow-flight h4 { margin: 0 0 2px 0; }
+          .ow-flight .meta { color: rgba(15,23,42,0.65); }
+
+          /* Improve contrast on Streamlit info/warning boxes */
+          div[data-testid="stAlert"] { border-radius: 14px; }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -559,7 +569,10 @@ def apply_theme(mode: str):
             """
             <style>
               html, body, [class*="stApp"] { background: #f6f8fc !important; }
-              [data-testid="stSidebar"] { background: #ffffff !important; border-right: 1px solid rgba(15,23,42,0.08); }
+              [data-testid="stSidebar"] {
+                background: #ffffff !important;
+                border-right: 1px solid rgba(15,23,42,0.10);
+              }
             </style>
             """,
             unsafe_allow_html=True,
@@ -571,11 +584,18 @@ def apply_theme(mode: str):
             """
             <style>
               html, body, [class*="stApp"] { background: #0b1220 !important; color: #e5e7eb !important; }
-              [data-testid="stSidebar"] { background: #0f172a !important; border-right: 1px solid rgba(148,163,184,0.12); }
-              .ow-card, .ow-flight, .ow-hero { background: rgba(15,23,42,0.8) !important; border: 1px solid rgba(148,163,184,0.14) !important; }
-              .ow-muted { color: rgba(226,232,240,0.75) !important; }
+              [data-testid="stSidebar"] { background: #0f172a !important; border-right: 1px solid rgba(148,163,184,0.14); }
+
+              .ow-hero { border: 1px solid rgba(148,163,184,0.14) !important; }
+              .ow-hero h1 { color: #e5e7eb !important; }
+              .ow-hero .ow-muted { color: rgba(226,232,240,0.75) !important; }
+
+              .ow-flight { background: rgba(15,23,42,0.85) !important; border: 1px solid rgba(148,163,184,0.14) !important; }
+              .ow-flight .meta { color: rgba(226,232,240,0.75) !important; }
+
               .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] {
-                background: rgba(2,6,23,0.6) !important; color: #e5e7eb !important;
+                background: rgba(2,6,23,0.55) !important;
+                color: #e5e7eb !important;
               }
             </style>
             """,
@@ -601,22 +621,22 @@ DEFAULTS = {
     "last_search_cards": None,
     "last_search_meta": None,
     "last_booking_payload": None,
-    "passengers_details": [],  # list[{"name": "", "whatsapp": ""}]
-    "_pending_action": None,   # "swap" | "clear"
+    "passenger_names": [],      # list[str]
+    "_pending_action": None,    # "swap" | "clear"
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-def _ensure_pax_details(pax: int):
+def _ensure_passenger_names(pax: int):
     pax = int(pax)
-    current = st.session_state.get("passengers_details") or []
+    current = st.session_state.get("passenger_names") or []
     if len(current) < pax:
-        current = current + [{"name": "", "whatsapp": ""} for _ in range(pax - len(current))]
+        current = current + ["" for _ in range(pax - len(current))]
     elif len(current) > pax:
         current = current[:pax]
-    st.session_state["passengers_details"] = current
+    st.session_state["passenger_names"] = current
 
 
 def _apply_pending_actions_before_widgets():
@@ -633,7 +653,7 @@ def _apply_pending_actions_before_widgets():
         st.session_state["origin_q"] = ((da or {}).get("iata") or "").lower()
         st.session_state["dest_q"] = ((oa or {}).get("iata") or "").lower()
 
-        # keep any existing last search results (still valid)
+        # keep last search results
         st.rerun()
 
     if action == "clear":
@@ -644,11 +664,10 @@ def _apply_pending_actions_before_widgets():
         st.session_state["origin_q"] = ""
         st.session_state["dest_q"] = ""
 
-        # Do NOT wipe last search automatically (user asked to keep)
+        # keep last search results (per your request)
         st.rerun()
 
 
-# Apply pending actions at the very top (before widgets)
 _apply_pending_actions_before_widgets()
 
 
@@ -656,7 +675,7 @@ _apply_pending_actions_before_widgets()
 # Sidebar: theme + filters
 # =========================
 st.sidebar.header("Settings")
-theme_mode = st.sidebar.selectbox("Theme", ["System", "Light", "Dark"], index=1)
+theme_mode = st.sidebar.selectbox("Theme", ["System", "Light", "Dark"], index=0)
 apply_theme(theme_mode)
 
 st.sidebar.markdown("---")
@@ -708,7 +727,7 @@ filtered = filtered.reset_index(drop=True)
 st.markdown(
     """
     <div class="ow-hero">
-      <h1 style="margin:0">Travel App</h1>
+      <h1>Travel App</h1>
       <div class="ow-muted" style="margin-top:6px">
         Select origin and destination, then search flights and create a WhatsApp/Email booking handoff.
       </div>
@@ -743,7 +762,6 @@ def airport_selector_block(title: str, key_prefix: str, preselected: dict | None
 
     options = results["label"].tolist()
 
-    # Preselect logic: if preselected iata exists, try to set the selectbox index to its label (if present)
     idx = 0
     if preselected and preselected.get("iata"):
         iata = preselected["iata"]
@@ -816,7 +834,6 @@ dest_airport = st.session_state.get("dest_airport")
 
 if not origin_airport or not dest_airport:
     st.warning("Select both origin and destination airports to continue.")
-    # Do not st.stop() hard; allow user to still see page layout
 else:
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -842,29 +859,25 @@ else:
     with c8:
         airline_pref = st.text_input("Airline preference (optional)", placeholder="e.g., KLM, Virgin, Lufthansa")
 
-    _ensure_pax_details(int(pax))
+    _ensure_passenger_names(int(pax))
 
-    with st.expander("Passenger details (per passenger)", expanded=True):
-        st.caption("Enter name + WhatsApp per passenger. These are included in the booking payload + PDF.")
+    with st.expander("Passenger names (per passenger)", expanded=True):
+        st.caption("Names scale with passenger count and are included in the booking payload + PDF.")
         for i in range(int(pax)):
-            pcol1, pcol2 = st.columns([2, 2])
-            with pcol1:
-                st.session_state["passengers_details"][i]["name"] = st.text_input(
-                    f"Passenger {i+1} name",
-                    value=st.session_state["passengers_details"][i].get("name", ""),
-                    key=f"pax_name_{i}",
-                    placeholder="e.g., Chukwuma Onunkwo",
-                )
-            with pcol2:
-                st.session_state["passengers_details"][i]["whatsapp"] = st.text_input(
-                    f"Passenger {i+1} WhatsApp",
-                    value=st.session_state["passengers_details"][i].get("whatsapp", ""),
-                    key=f"pax_wa_{i}",
-                    placeholder="+234xxxxxxxxxx",
-                )
+            st.session_state["passenger_names"][i] = st.text_input(
+                f"Passenger {i+1} name",
+                value=st.session_state["passenger_names"][i] or "",
+                key=f"pax_name_{i}",
+                placeholder="e.g., Chukwuma Onunkwo",
+            )
 
     notes = st.text_area("Notes / preferences (optional)", placeholder="Baggage, time preference, avoid long layovers, etc.")
-    email_to = st.text_input("Email (optional)", placeholder="agent@company.com or your email")
+
+    # WhatsApp per booking (single)
+    booking_whatsapp = st.text_input("Booking WhatsApp (one per booking)", placeholder="+234xxxxxxxxxx")
+
+    # Email once per booking (single)
+    booking_email = st.text_input("Email (one per booking)", placeholder="agent@company.com or your email")
 
     if trip_type == "Return" and return_date and return_date < depart_date:
         st.error("Return date cannot be earlier than departure date.")
@@ -877,7 +890,7 @@ else:
     do_search = b1.button("🔎 Search flights", use_container_width=True)
     do_booking = b2.button("✅ Create booking handoff", use_container_width=True)
 
-    # Update search state (persist results)
+    # Persist results on search
     if do_search:
         flex_days = 3 if flexible else 0
         cards = mock_flight_search_results(
@@ -901,7 +914,7 @@ else:
             "flexible": bool(flexible),
         }
 
-    # Render flight results if we have them (so they remain visible when booking is clicked)
+    # Render persisted results (so they remain visible when booking is clicked)
     cards = st.session_state.get("last_search_cards")
     meta = st.session_state.get("last_search_meta")
 
@@ -917,8 +930,7 @@ else:
             with left:
                 st.markdown(airline_badge_svg(r.get("airline_code", "XX")), unsafe_allow_html=True)
             with mid:
-                st.markdown(f"**{r['airline']}**")
-                st.caption(f"{r['stops']} • {r['duration']} • {r['note']}")
+                st.markdown(f"<div class='ow-flight'><b>{r['airline']}</b><div class='meta'>{r['stops']} • {r['duration']} • {r['note']}</div></div>", unsafe_allow_html=True)
             with right:
                 st.markdown(f"**{r['price']}**")
                 st.button(f"Select {r['airline']}", key=f"sel_{r['airline']}", help="Mock selection (live booking next).")
@@ -929,7 +941,7 @@ else:
         st.subheader("Booking handoff")
 
         flex_label = "±3 days" if flexible else ""
-        pax_details = st.session_state.get("passengers_details") or []
+        passenger_names = st.session_state.get("passenger_names") or []
 
         booking_payload = {
             "created_at": datetime.utcnow().isoformat() + "Z",
@@ -941,8 +953,10 @@ else:
             "depart_date": str(depart_date),
             "return_date": str(return_date) if (trip_type == "Return" and return_date) else "",
             "flexible_dates": flex_label,
-            "passengers_details": pax_details,
-            "traveler_name": pax_details[0].get("name", "") if pax_details else "",
+            "passenger_names": passenger_names,
+            "traveler_name": (passenger_names[0] if passenger_names else ""),
+            "booking_whatsapp": booking_whatsapp.strip(),
+            "booking_email": booking_email.strip(),
             "budget": budget.strip(),
             "airline_pref": airline_pref.strip(),
             "notes": notes.strip(),
@@ -990,27 +1004,23 @@ else:
             f"**Departure:** {booking_payload['depart_date']}  •  **Return:** {booking_payload['return_date'] or '-'}  •  **Flexible:** {booking_payload['flexible_dates'] or '-'}"
         )
 
-        st.markdown("### Passenger details")
-        for i, pxd in enumerate(pax_details, start=1):
-            st.write(f"{i}. **{pxd.get('name','-') or '-'}** — {pxd.get('whatsapp','-') or '-'}")
+        st.markdown("### Passenger names")
+        for i, nm in enumerate(passenger_names, start=1):
+            st.write(f"{i}. **{(nm or '-')}**")
 
         st.markdown("### WhatsApp-ready message")
         st.code(handoff_message)
 
-        # WhatsApp link (use first passenger whatsapp if available, else blank)
-        default_phone = ""
-        if pax_details and pax_details[0].get("whatsapp"):
-            default_phone = pax_details[0]["whatsapp"]
-        wa_url = whatsapp_link(handoff_message, phone_e164=default_phone.strip())
+        wa_url = whatsapp_link(handoff_message, phone_e164=booking_whatsapp.strip())
         try:
             st.link_button("Open WhatsApp", wa_url, use_container_width=True)
         except Exception:
             st.markdown(f"**Open WhatsApp:** {wa_url}")
 
-        # Email handoff (mailto)
+        # Email handoff (mailto) — one per booking
         subj = quote(f"Flight booking request: {o.get('iata','')} → {d.get('iata','')}")
         body = quote(handoff_message)
-        to = (email_to or "").strip()
+        to = (booking_email or "").strip()
         mailto = f"mailto:{to}?subject={subj}&body={body}" if to else f"mailto:?subject={subj}&body={body}"
         try:
             st.link_button("Open email draft", mailto, use_container_width=True)
