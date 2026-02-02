@@ -453,26 +453,11 @@ def apply_theme(mode: str):
 # =========================
 # Airtable (aligned to YOUR table columns)
 # =========================
-def _airtable_api_key() -> str:
-    return (get_config("AIRTABLE_PAT") or get_config("AIRTABLE_API_KEY") or "").strip()
-
-
-def _airtable_base_id() -> str:
-    return (get_config("AIRTABLE_BASE_ID") or "").strip()
-
-
-def _airtable_table_name() -> str:
-    return (get_config("AIRTABLE_TABLE_NAME") or get_config("AIRTABLE_TABLE") or "").strip()
-
-
-def airtable_enabled() -> bool:
-    use_flag = (get_config("USE_AIRTABLE") or "").strip()
-    if use_flag and use_flag not in ("1", "true", "True", "yes", "YES"):
-        return False
-    return bool(_airtable_api_key() and _airtable_base_id() and _airtable_table_name())
-
-
 def save_to_airtable(payload: dict) -> tuple[bool, str]:
+    """
+    Writes fields that match your Airtable columns (per your CSV export).
+    Airtable rejects unknown field names, so names must match exactly.
+    """
     if requests is None:
         return False, "requests not installed."
 
@@ -484,33 +469,57 @@ def save_to_airtable(payload: dict) -> tuple[bool, str]:
         return False, "Airtable not configured (missing key/base/table)."
 
     url = f"https://api.airtable.com/v0/{base_id}/{quote(str(table))}"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    pax_details = payload.get("passengers_details", []) or []
-    pax_summary = " | ".join(
-        [f"{i+1}. {d.get('name','-') or '-'} ({d.get('whatsapp','-') or '-'})" for i, d in enumerate(pax_details)]
-    )
-
-    # IMPORTANT: these field names match your CSV export columns
-    fields = {
-        "created_at": payload.get("created_at", ""),
-        "origin_iata": payload.get("origin", {}).get("iata", ""),
-        "destination_iata": payload.get("destination", {}).get("iata", ""),
-        "origin_city": payload.get("origin", {}).get("city", ""),
-        "destination_city": payload.get("destination", {}).get("city", ""),
-        "trip_type": payload.get("trip_type", ""),
-        "departure_date": payload.get("depart_date", ""),
-        "return_date": payload.get("return_date", ""),
-        "passengers": int(payload.get("pax", 1)),
-        "cabin_class": payload.get("cabin", ""),
-        "budget": payload.get("budget", ""),
-        "airline_preference": payload.get("airline_pref", ""),
-        "flexible_dates": payload.get("flexible_dates", ""),
-        "notes": payload.get("notes", ""),
-        "status": payload.get("status", "NEW"),
-        "handoff_message": payload.get("handoff_message", ""),
-        "passengers_details": pax_summary,
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
+
+    origin = payload.get("origin", {}) or {}
+    dest = payload.get("destination", {}) or {}
+    pax_details = payload.get("passengers_details", []) or []
+
+    # Use passenger 1 whatsapp if present (matches your table column whatsapp_phone)
+    whatsapp_phone = ""
+    if pax_details and pax_details[0].get("whatsapp"):
+        whatsapp_phone = str(pax_details[0].get("whatsapp", "")).strip()
+
+    # Your Airtable columns (from CSV) — these names MUST match exactly
+    fields = {
+        "booking_id": payload.get("booking_id", ""),  # optional if you generate one
+        "created_at": payload.get("created_at", ""),
+        "status": payload.get("status", "NEW"),
+        "traveler_name": payload.get("traveler_name", payload.get("traveler", payload.get("traveler_name", ""))) or "",
+        "passengers": int(payload.get("pax", 1)),
+        "cabin": payload.get("cabin", ""),
+        "trip_type": payload.get("trip_type", ""),
+        "depart_date": payload.get("depart_date", ""),     # ✅ correct
+        "return_date": payload.get("return_date", ""),
+        "flexible_dates": payload.get("flexible_dates", ""),
+        "flex_window_days": payload.get("flex_window_days", 3 if payload.get("flexible_dates") else 0),
+
+        "origin_iata": origin.get("iata", ""),
+        "origin_city": origin.get("city", ""),
+        "origin_airport_name": origin.get("airport_name", origin.get("name", "")),
+
+        "destination_iata": dest.get("iata", ""),
+        "destination_city": dest.get("city", ""),
+        "destination_airport_name": dest.get("airport_name", dest.get("name", "")),
+
+        "budget": payload.get("budget", ""),
+        "airline_preference": payload.get("airline_pref", payload.get("airline_preference", "")),
+        "notes": payload.get("notes", ""),
+
+        "whatsapp_phone": whatsapp_phone,
+        "contact_email": payload.get("contact_email", payload.get("email", "")) or "",
+
+        "handoff_message": payload.get("handoff_message", ""),
+        "whatsapp_url": payload.get("whatsapp_url", ""),
+        "email_mailto": payload.get("email_mailto", ""),
+        "booking_pdf_url": payload.get("booking_pdf_url", ""),
+    }
+
+    # Airtable does not like None in some fields
+    fields = {k: ("" if v is None else v) for k, v in fields.items()}
 
     body = {"records": [{"fields": fields}]}
 
