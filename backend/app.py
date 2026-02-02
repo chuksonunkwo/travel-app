@@ -11,18 +11,16 @@ import streamlit as st
 
 # Optional deps (do not break app if missing)
 try:
-    import requests  # Airtable
+    import requests  # for Airtable
 except Exception:
     requests = None
 
 
 # =========================
-# Paths / Config
+# Config
 # =========================
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
-ASSETS_DIR = APP_DIR / "assets"
-AIRLINE_SVG_DIR = ASSETS_DIR / "airlines"
 
 CANDIDATE_CSVS = [
     DATA_DIR / "airports_clean.csv",
@@ -35,11 +33,18 @@ DEFAULT_LIMIT = 30
 # local fallback storage (dev; production containers can be ephemeral, prefer Airtable)
 BOOKING_STORE_PATH = DATA_DIR / "booking_requests.jsonl"
 
+# Optional: folder for verified airline logos (SVG files named by IATA airline code, e.g. BA.svg)
+AIRLINE_SVG_DIR = APP_DIR / "assets" / "airlines"
+
 
 # =========================
 # Small utilities
 # =========================
 def _safe_get_secrets(key: str, default=None):
+    """
+    Accessing st.secrets can raise errors if secrets.toml doesn't exist.
+    Never break the app because of missing secrets.
+    """
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -47,6 +52,9 @@ def _safe_get_secrets(key: str, default=None):
 
 
 def get_config(key: str, default=None):
+    """
+    Prefer env vars (Render-friendly), fall back to st.secrets.
+    """
     v = os.getenv(key)
     if v is not None and str(v).strip() != "":
         return v
@@ -95,6 +103,14 @@ def find_airports_csv() -> Path:
 
 
 def standardize_airports_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supports:
+      A) clean format: iata, name, city, country_code, ...
+      B) OurAirports raw: iata_code, municipality, iso_country, ...
+    Produces canonical:
+      iata, name, city, country_code, type, scheduled_service, iso_region, ident,
+      latitude_deg, longitude_deg, label, search_*
+    """
     cols = set(df.columns)
 
     if "iata" in cols:
@@ -150,6 +166,7 @@ def standardize_airports_df(df: pd.DataFrame) -> pd.DataFrame:
         return f"{city} — {name} ({iata}) [{cc}]"
 
     out["label"] = out.apply(_label, axis=1)
+
     out["search_iata"] = out["iata"].map(normalize_text)
     out["search_name"] = out["name"].map(normalize_text)
     out["search_city"] = out["city"].map(normalize_text)
@@ -248,7 +265,273 @@ def append_local_jsonl(payload: dict) -> None:
 
 
 # =========================
-# Airline logo handling (repo SVG + fallback)
+# Airtable
+# =========================
+def _airtable_api_key() -> str:
+    # Support both styles: AIRTABLE_PAT (recommended) OR AIRTABLE_API_KEY
+    return (get_config("AIRTABLE_PAT") or get_config("AIRTABLE_API_KEY") or "").strip()
+
+
+def _airtable_base_id() -> str:
+    return (get_config("AIRTABLE_BASE_ID") or "").strip()
+
+
+def _airtable_table_name() -> str:
+    # Support both styles: AIRTABLE_TABLE_NAME OR AIRTABLE_TABLE
+    return (get_config("AIRTABLE_TABLE_NAME") or get_config("AIRTABLE_TABLE") or "").strip()
+
+
+def airtable_enabled() -> bool:
+    """
+    True if Airtable credentials exist and USE_AIRTABLE is not explicitly disabled.
+    """
+    use_flag = (get_config("USE_AIRTABLE") or "").strip()
+    if use_flag and use_flag not in ("1", "true", "True", "yes", "YES"):
+        return False
+    return bool(_airtable_api_key() and _airtable_base_id() and _airtable_table_name())
+
+
+def _make_booking_id(origin_iata: str, dest_iata: str, depart_date_str: str) -> str:
+    # Example: LOS-LHR-2026-01-29-001
+    base = f"{(origin_iata or 'XXX')}-{(dest_iata or 'XXX')}-{(depart_date_str or 'YYYY-MM-DD')}"
+    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+    return f"{base}-{stamp}"
+
+
+def save_to_airtable(payload: dict) -> tuple[bool, str]:
+    """
+    Save to Airtable using field names aligned to YOUR table (from your CSV).
+
+    This avoids Airtable UNKNOWN_FIELD_NAME errors like "departure_date".
+    """
+    if requests is None:
+        return False, "requests not installed."
+
+    api_key = _airtable_api_key()
+    base_id = _airtable_base_id()
+    table = _airtable_table_name()
+
+    if not api_key or not base_id or not table:
+        return False, "Airtable not configured (missing key/base/table)."
+
+    url = f"https://api.airtable.com/v0/{base_id}/{quote(str(table))}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    origin = payload.get("origin", {}) or {}
+    dest = payload.get("destination", {}) or {}
+
+    depart_date_str = payload.get("depart_date", "") or ""
+    booking_id = payload.get("booking_id") or _make_booking_id(origin.get("iata", ""), dest.get("iata", ""), depart_date_str)
+
+    pax_details = payload.get("passengers_details") or []
+    traveler_name = payload.get("traveler_name") or (pax_details[0].get("name", "") if pax_details else "")
+
+    # Build message links (match your table columns)
+    handoff_message = payload.get("handoff_message", "") or ""
+    default_phone = ""
+    if pax_details and pax_details[0].get("whatsapp"):
+        default_phone = pax_details[0].get("whatsapp", "")
+    whatsapp_url = whatsapp_link(handoff_message, phone_e164=(default_phone or "").strip())
+
+    contact_email = (payload.get("contact_email") or "").strip()
+    subj = quote(f"Flight booking request: {origin.get('iata','')} → {dest.get('iata','')}")
+    body = quote(handoff_message)
+    email_mailto = f"mailto:{contact_email}?subject={subj}&body={body}" if contact_email else f"mailto:?subject={subj}&body={body}"
+
+    # IMPORTANT: Use your Airtable column names (from your CSV)
+    fields = {
+        "booking_id": booking_id,
+        "created_at": payload.get("created_at", ""),
+        "status": payload.get("status", "NEW"),
+        "traveler_name": traveler_name,
+
+        "passengers": int(payload.get("passengers", payload.get("pax", 1)) or 1),
+        "cabin": payload.get("cabin", ""),
+        "trip_type": payload.get("trip_type", ""),
+
+        "depart_date": payload.get("depart_date", ""),
+        "return_date": payload.get("return_date", ""),
+        "flexible_dates": payload.get("flexible_dates", ""),
+        "flex_window_days": int(payload.get("flex_window_days", 3 if payload.get("flexible_dates") else 0) or 0),
+
+        "origin_iata": origin.get("iata", ""),
+        "origin_city": origin.get("city", ""),
+        "origin_airport_name": origin.get("airport_name", ""),
+
+        "destination_iata": dest.get("iata", ""),
+        "destination_city": dest.get("city", ""),
+        "destination_airport_name": dest.get("airport_name", ""),
+
+        "budget": (payload.get("budget", "") or "").strip(),
+        "airline_preference": (payload.get("airline_preference") or payload.get("airline_pref") or "").strip(),
+        "notes": (payload.get("notes", "") or "").strip(),
+
+        "whatsapp_phone": (default_phone or "").strip(),
+        "contact_email": contact_email,
+
+        "handoff_message": handoff_message,
+        "whatsapp_url": whatsapp_url,
+        "email_mailto": email_mailto,
+
+        # If you later host PDFs somewhere, populate booking_pdf_url. Leave blank for now.
+        "booking_pdf_url": (payload.get("booking_pdf_url", "") or "").strip(),
+    }
+
+    body = {"records": [{"fields": fields}]}
+
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=20)
+        if 200 <= r.status_code < 300:
+            return True, "Saved to Airtable."
+        return False, f"Airtable error {r.status_code}: {r.text[:500]}"
+    except Exception as e:
+        return False, f"Airtable request failed: {e}"
+
+
+# =========================
+# Handoff + PDF
+# =========================
+def build_handoff_message(payload: dict) -> str:
+    origin = payload.get("origin", {})
+    dest = payload.get("destination", {})
+    trip_type = payload.get("trip_type", "")
+    depart_date = payload.get("depart_date", "")
+    return_date = payload.get("return_date", "")
+
+    passengers = payload.get("passengers", payload.get("pax", 1))
+    cabin = payload.get("cabin", "")
+    flex = payload.get("flexible_dates", "")
+    budget = payload.get("budget", "")
+    airline = payload.get("airline_preference", payload.get("airline_pref", ""))
+    notes = payload.get("notes", "")
+
+    pax_details = payload.get("passengers_details", []) or []
+    pax_lines = []
+    for i, d in enumerate(pax_details, start=1):
+        nm = d.get("name", "") or "-"
+        wa = d.get("whatsapp", "") or "-"
+        pax_lines.append(f"{i}. {nm} — {wa}")
+
+    lines = [
+        "🧭 *Travel App — Flight Booking Request*",
+        "",
+        f"📍 *Origin:* {origin.get('city','')} ({origin.get('iata','')})",
+        f"🎯 *Destination:* {dest.get('city','')} ({dest.get('iata','')})",
+        "",
+        f"🧳 *Passengers:* {passengers}",
+        f"💺 *Cabin:* {cabin}",
+        f"🔁 *Trip:* {trip_type}",
+        f"📅 *Departure:* {depart_date}",
+    ]
+    if trip_type == "Return":
+        lines.append(f"📅 *Return:* {return_date or '-'}")
+
+    if flex:
+        lines += ["", f"📆 *Flexible:* {flex}"]
+
+    if pax_lines:
+        lines += ["", "👥 *Passenger details:*"] + pax_lines
+
+    if budget:
+        lines += ["", f"💰 *Budget:* {budget}"]
+
+    if airline:
+        lines += ["", f"✈️ *Airline preference:* {airline}"]
+
+    if notes:
+        lines += ["", f"📝 *Notes:* {notes}"]
+
+    lines += ["", "✅ Please share best available options + total price.", "🙏 Thank you!"]
+    return "\n".join(lines)
+
+
+def create_booking_pdf_bytes(booking_payload: dict) -> bytes | None:
+    """
+    Creates a PDF summary. Requires reportlab; if missing, returns None (no breakage).
+    """
+    try:
+        from io import BytesIO
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib import colors
+    except Exception:
+        return None
+
+    origin = booking_payload.get("origin", {})
+    dest = booking_payload.get("destination", {})
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+
+    title = Paragraph("<b>Travel App — Booking Request Summary</b>", styles["Title"])
+    created = booking_payload.get("created_at", "")
+
+    def p(txt: str):
+        return Paragraph(txt, styles["BodyText"])
+
+    elements = [
+        title,
+        Spacer(1, 10),
+        p(f"<b>Created:</b> {created}"),
+        Spacer(1, 10),
+        p(f"<b>Origin:</b> {origin.get('city','')} ({origin.get('iata','')}) — {origin.get('airport_name','')}"),
+        p(f"<b>Destination:</b> {dest.get('city','')} ({dest.get('iata','')}) — {dest.get('airport_name','')}"),
+        Spacer(1, 12),
+    ]
+
+    pax_details = booking_payload.get("passengers_details", []) or []
+    pax_text = ""
+    if pax_details:
+        lines = []
+        for i, pxd in enumerate(pax_details, start=1):
+            nm = pxd.get("name", "") or "-"
+            wa = pxd.get("whatsapp", "") or "-"
+            lines.append(f"{i}. {nm} — {wa}")
+        pax_text = "<br/>".join(lines)
+
+    rows = [
+        ["Passengers", str(booking_payload.get("passengers", booking_payload.get("pax", "")))],
+        ["Cabin", booking_payload.get("cabin", "")],
+        ["Trip type", booking_payload.get("trip_type", "")],
+        ["Departure", booking_payload.get("depart_date", "")],
+        ["Return", booking_payload.get("return_date", "") or "-"],
+        ["Flexible", booking_payload.get("flexible_dates", "") or "-"],
+        ["Budget", booking_payload.get("budget", "") or "-"],
+        ["Airline preference", booking_payload.get("airline_preference", booking_payload.get("airline_pref", "")) or "-"],
+        ["Notes", booking_payload.get("notes", "") or "-"],
+        ["Passenger details", pax_text or "-"],
+        ["Status", booking_payload.get("status", "")],
+    ]
+
+    table = Table(rows, colWidths=[140, 360])
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ]
+        )
+    )
+    elements += [table, Spacer(1, 14)]
+
+    elements += [p("<b>WhatsApp / Message Handoff</b>"), Spacer(1, 6)]
+    msg = (booking_payload.get("handoff_message", "") or "").replace("\n", "<br/>")
+    elements += [p(msg)]
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
+# =========================
+# Airline badges / logos
 # =========================
 def airline_badge_svg(code: str, style_seed: int = 0) -> str:
     code = (code or "XX")[:2].upper()
@@ -275,40 +558,34 @@ def airline_badge_svg(code: str, style_seed: int = 0) -> str:
     """
 
 
-def load_airline_svg_from_repo(iata_code: str) -> str | None:
-    code = (iata_code or "").strip().upper()
-    if not code:
-        return None
+def get_airline_svg(code: str, fallback_seed: int = 0) -> str:
+    """
+    If backend/assets/airlines/{CODE}.svg exists, use it.
+    Else fall back to generated badge SVG.
+    """
+    code = (code or "XX").upper().strip()
     p = AIRLINE_SVG_DIR / f"{code}.svg"
-    if not file_exists(p):
-        return None
     try:
-        # Read raw SVG text (no external fetch, no CORS issues)
-        return p.read_text(encoding="utf-8")
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8")
     except Exception:
-        return None
-
-
-def airline_logo_svg(iata_code: str, style_seed: int = 0) -> str:
-    svg = load_airline_svg_from_repo(iata_code)
-    if svg:
-        return svg
-    return airline_badge_svg(iata_code, style_seed=style_seed)
+        pass
+    return airline_badge_svg(code, style_seed=fallback_seed)
 
 
 # =========================
-# Mock flight results (still used until Amadeus is live)
+# Mock flight results
 # =========================
 def mock_flight_search_results(
     origin_iata: str,
     dest_iata: str,
     depart_date: date,
-    pax: int,
+    passengers: int,
     cabin: str,
     trip_type: str,
     flex_days: int = 0,
 ) -> list[dict]:
-    seed = sum(ord(c) for c in (origin_iata + dest_iata)) + int(depart_date.strftime("%Y%m%d")) + pax + flex_days
+    seed = sum(ord(c) for c in (origin_iata + dest_iata)) + int(depart_date.strftime("%Y%m%d")) + int(passengers) + int(flex_days)
     base = 180 + (seed % 220)
     cabin_mult = {"Economy": 1.0, "Premium Economy": 1.35, "Business": 2.3, "First": 3.2}.get(cabin, 1.0)
     trip_mult = 1.0 if trip_type == "One-way" else 1.75
@@ -362,6 +639,7 @@ def apply_theme(mode: str):
         <style>
           .block-container { padding-top: 1.1rem; padding-bottom: 3rem; max-width: 1200px; }
           [data-testid="stSidebar"] { border-right: 1px solid rgba(15,23,42,0.08); }
+
           h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
           .ow-muted { opacity: 0.78; }
 
@@ -385,7 +663,6 @@ def apply_theme(mode: str):
             margin: 10px 0;
           }
 
-          /* Make buttons clearly visible */
           .stButton button, .stDownloadButton button { border-radius: 12px !important; font-weight: 650 !important; }
           .stButton { margin-top: 0.2rem; margin-bottom: 0.2rem; }
 
@@ -451,227 +728,13 @@ def apply_theme(mode: str):
 
 
 # =========================
-# Airtable (aligned to YOUR table columns)
-# =========================
-def save_to_airtable(payload: dict) -> tuple[bool, str]:
-    """
-    Writes fields that match your Airtable columns (per your CSV export).
-    Airtable rejects unknown field names, so names must match exactly.
-    """
-    if requests is None:
-        return False, "requests not installed."
-
-    api_key = _airtable_api_key()
-    base_id = _airtable_base_id()
-    table = _airtable_table_name()
-
-    if not api_key or not base_id or not table:
-        return False, "Airtable not configured (missing key/base/table)."
-
-    url = f"https://api.airtable.com/v0/{base_id}/{quote(str(table))}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    origin = payload.get("origin", {}) or {}
-    dest = payload.get("destination", {}) or {}
-    pax_details = payload.get("passengers_details", []) or []
-
-    # Use passenger 1 whatsapp if present (matches your table column whatsapp_phone)
-    whatsapp_phone = ""
-    if pax_details and pax_details[0].get("whatsapp"):
-        whatsapp_phone = str(pax_details[0].get("whatsapp", "")).strip()
-
-    # Your Airtable columns (from CSV) — these names MUST match exactly
-    fields = {
-        "booking_id": payload.get("booking_id", ""),  # optional if you generate one
-        "created_at": payload.get("created_at", ""),
-        "status": payload.get("status", "NEW"),
-        "traveler_name": payload.get("traveler_name", payload.get("traveler", payload.get("traveler_name", ""))) or "",
-        "passengers": int(payload.get("pax", 1)),
-        "cabin": payload.get("cabin", ""),
-        "trip_type": payload.get("trip_type", ""),
-        "depart_date": payload.get("depart_date", ""),     # ✅ correct
-        "return_date": payload.get("return_date", ""),
-        "flexible_dates": payload.get("flexible_dates", ""),
-        "flex_window_days": payload.get("flex_window_days", 3 if payload.get("flexible_dates") else 0),
-
-        "origin_iata": origin.get("iata", ""),
-        "origin_city": origin.get("city", ""),
-        "origin_airport_name": origin.get("airport_name", origin.get("name", "")),
-
-        "destination_iata": dest.get("iata", ""),
-        "destination_city": dest.get("city", ""),
-        "destination_airport_name": dest.get("airport_name", dest.get("name", "")),
-
-        "budget": payload.get("budget", ""),
-        "airline_preference": payload.get("airline_pref", payload.get("airline_preference", "")),
-        "notes": payload.get("notes", ""),
-
-        "whatsapp_phone": whatsapp_phone,
-        "contact_email": payload.get("contact_email", payload.get("email", "")) or "",
-
-        "handoff_message": payload.get("handoff_message", ""),
-        "whatsapp_url": payload.get("whatsapp_url", ""),
-        "email_mailto": payload.get("email_mailto", ""),
-        "booking_pdf_url": payload.get("booking_pdf_url", ""),
-    }
-
-    # Airtable does not like None in some fields
-    fields = {k: ("" if v is None else v) for k, v in fields.items()}
-
-    body = {"records": [{"fields": fields}]}
-
-    try:
-        r = requests.post(url, headers=headers, json=body, timeout=20)
-        if 200 <= r.status_code < 300:
-            return True, "Saved to Airtable."
-        return False, f"Airtable error {r.status_code}: {r.text[:500]}"
-    except Exception as e:
-        return False, f"Airtable request failed: {e}"
-
-
-# =========================
-# Handoff + PDF
-# =========================
-def build_handoff_message(payload: dict) -> str:
-    origin = payload.get("origin", {})
-    dest = payload.get("destination", {})
-    trip_type = payload.get("trip_type", "")
-    depart_date = payload.get("depart_date", "")
-    return_date = payload.get("return_date", "")
-
-    pax = payload.get("pax", 1)
-    cabin = payload.get("cabin", "")
-    flex = payload.get("flexible_dates", "")
-    budget = payload.get("budget", "")
-    airline = payload.get("airline_pref", "")
-    notes = payload.get("notes", "")
-
-    pax_details = payload.get("passengers_details", []) or []
-    pax_lines = []
-    for i, d in enumerate(pax_details, start=1):
-        nm = d.get("name", "") or "-"
-        wa = d.get("whatsapp", "") or "-"
-        pax_lines.append(f"{i}. {nm} — {wa}")
-
-    lines = [
-        "🧭 *Travel App — Flight Booking Request*",
-        "",
-        f"📍 *Origin:* {origin.get('city','')} ({origin.get('iata','')})",
-        f"🎯 *Destination:* {dest.get('city','')} ({dest.get('iata','')})",
-        "",
-        f"🧳 *Passengers:* {pax}",
-        f"💺 *Cabin:* {cabin}",
-        f"🔁 *Trip:* {trip_type}",
-        f"📅 *Departure:* {depart_date}",
-    ]
-    if trip_type == "Return":
-        lines.append(f"📅 *Return:* {return_date or '-'}")
-
-    if flex:
-        lines += ["", f"📆 *Flexible:* {flex}"]
-    if pax_lines:
-        lines += ["", "👥 *Passenger details:*"] + pax_lines
-    if budget:
-        lines += ["", f"💰 *Budget:* {budget}"]
-    if airline:
-        lines += ["", f"✈️ *Airline preference:* {airline}"]
-    if notes:
-        lines += ["", f"📝 *Notes:* {notes}"]
-
-    lines += ["", "✅ Please share best available options + total price.", "🙏 Thank you!"]
-    return "\n".join(lines)
-
-
-def create_booking_pdf_bytes(booking_payload: dict) -> bytes | None:
-    try:
-        from io import BytesIO
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib import colors
-    except Exception:
-        return None
-
-    origin = booking_payload.get("origin", {})
-    dest = booking_payload.get("destination", {})
-
-    buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
-    styles = getSampleStyleSheet()
-
-    title = Paragraph("<b>Travel App — Booking Request Summary</b>", styles["Title"])
-    created = booking_payload.get("created_at", "")
-
-    def p(txt: str):
-        return Paragraph(txt, styles["BodyText"])
-
-    elements = [
-        title,
-        Spacer(1, 10),
-        p(f"<b>Created:</b> {created}"),
-        Spacer(1, 10),
-        p(f"<b>Origin:</b> {origin.get('city','')} ({origin.get('iata','')}) — {origin.get('airport_name','')}"),
-        p(f"<b>Destination:</b> {dest.get('city','')} ({dest.get('iata','')}) — {dest.get('airport_name','')}"),
-        Spacer(1, 12),
-    ]
-
-    pax_details = booking_payload.get("passengers_details", []) or []
-    pax_text = ""
-    if pax_details:
-        lines = []
-        for i, pxd in enumerate(pax_details, start=1):
-            nm = pxd.get("name", "") or "-"
-            wa = pxd.get("whatsapp", "") or "-"
-            lines.append(f"{i}. {nm} — {wa}")
-        pax_text = "<br/>".join(lines)
-
-    rows = [
-        ["Passengers", str(booking_payload.get("pax", ""))],
-        ["Cabin", booking_payload.get("cabin", "")],
-        ["Trip type", booking_payload.get("trip_type", "")],
-        ["Departure", booking_payload.get("depart_date", "")],
-        ["Return", booking_payload.get("return_date", "") or "-"],
-        ["Flexible", booking_payload.get("flexible_dates", "") or "-"],
-        ["Budget", booking_payload.get("budget", "") or "-"],
-        ["Airline preference", booking_payload.get("airline_pref", "") or "-"],
-        ["Notes", booking_payload.get("notes", "") or "-"],
-        ["Passenger details", pax_text or "-"],
-        ["Status", booking_payload.get("status", "")],
-    ]
-
-    table = Table(rows, colWidths=[140, 360])
-    table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 10),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
-            ]
-        )
-    )
-    elements += [table, Spacer(1, 14)]
-
-    elements += [p("<b>WhatsApp / Message Handoff</b>"), Spacer(1, 6)]
-    msg = (booking_payload.get("handoff_message", "") or "").replace("\n", "<br/>")
-    elements += [p(msg)]
-
-    doc.build(elements)
-    return buf.getvalue()
-
-
-# =========================
-# Streamlit page config
+# Page config
 # =========================
 st.set_page_config(page_title="Travel App", page_icon="🧭", layout="wide")
 
 
 # =========================
-# Session state
+# Session state (init + pending actions)
 # =========================
 DEFAULTS = {
     "origin_airport": None,
@@ -681,25 +744,29 @@ DEFAULTS = {
     "last_search_cards": None,
     "last_search_meta": None,
     "last_booking_payload": None,
-    "passengers_details": [],
-    "_pending_action": None,  # "swap" | "clear"
+    "passengers_details": [],  # list[{"name": "", "whatsapp": ""}]
+    "_pending_action": None,   # "swap" | "clear"
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-def _ensure_pax_details(pax: int):
-    pax = int(pax)
+def _ensure_pax_details(passengers: int):
+    passengers = int(passengers)
     current = st.session_state.get("passengers_details") or []
-    if len(current) < pax:
-        current = current + [{"name": "", "whatsapp": ""} for _ in range(pax - len(current))]
-    elif len(current) > pax:
-        current = current[:pax]
+    if len(current) < passengers:
+        current = current + [{"name": "", "whatsapp": ""} for _ in range(passengers - len(current))]
+    elif len(current) > passengers:
+        current = current[:passengers]
     st.session_state["passengers_details"] = current
 
 
 def _apply_pending_actions_before_widgets():
+    """
+    Must run BEFORE widgets are created.
+    Fixes Streamlit session_state mutation errors when swapping/clearing.
+    """
     action = st.session_state.get("_pending_action")
 
     if action == "swap":
@@ -707,8 +774,11 @@ def _apply_pending_actions_before_widgets():
         oa = st.session_state.get("origin_airport")
         da = st.session_state.get("dest_airport")
         st.session_state["origin_airport"], st.session_state["dest_airport"] = da, oa
+
+        # Make movement visible by swapping query text too (safe here)
         st.session_state["origin_q"] = ((da or {}).get("iata") or "").lower()
         st.session_state["dest_q"] = ((oa or {}).get("iata") or "").lower()
+
         st.rerun()
 
     if action == "clear":
@@ -717,6 +787,7 @@ def _apply_pending_actions_before_widgets():
         st.session_state["dest_airport"] = None
         st.session_state["origin_q"] = ""
         st.session_state["dest_q"] = ""
+        # Do NOT wipe last search automatically
         st.rerun()
 
 
@@ -724,21 +795,22 @@ _apply_pending_actions_before_widgets()
 
 
 # =========================
-# Sidebar: theme + status + filters
+# Sidebar: theme + filters + status
 # =========================
 st.sidebar.header("Settings")
 theme_mode = st.sidebar.selectbox("Theme", ["System", "Light", "Dark"], index=0)
 apply_theme(theme_mode)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Status")
+st.sidebar.header("Status")
 st.sidebar.write(f"**Airtable enabled:** {'Yes' if airtable_enabled() else 'No'}")
-st.sidebar.write(f"**Airline SVG folder:** {'OK' if AIRLINE_SVG_DIR.exists() else 'Missing'}")
-st.sidebar.caption("Tip: On Render, set env vars in the service settings.")
+st.sidebar.write(f"**Airline SVG folder:** {'Present' if (AIRLINE_SVG_DIR.exists()) else 'Missing'}")
+st.sidebar.caption("Tip: On Render, set env vars in the service settings (Environment).")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
 
+# Load airports
 try:
     airports = load_airports()
 except Exception as e:
@@ -755,8 +827,17 @@ if not default_types and types:
     default_types = types[:]
 
 selected_types = st.sidebar.multiselect("Airport type", options=types, default=default_types) if types else []
+if not types:
+    st.sidebar.info("Airport types not available in this CSV.")
+
 selected_countries = st.sidebar.multiselect("Country (ISO)", options=countries, default=[]) if countries else []
+if not countries:
+    st.sidebar.info("Country codes not available in this CSV.")
+
 selected_scheduled = st.sidebar.multiselect("Scheduled service", options=scheduled, default=[]) if scheduled else []
+if not scheduled:
+    st.sidebar.info("Scheduled service not available in this CSV.")
+
 limit = st.sidebar.slider("Max suggestions", min_value=10, max_value=100, value=DEFAULT_LIMIT, step=5)
 
 filtered = airports.copy()
@@ -804,6 +885,7 @@ def airport_selector_block(title: str, key_prefix: str, preselected: dict | None
     if q_key not in st.session_state:
         st.session_state[q_key] = ""
 
+    # Respect preloaded swap values (set before widgets)
     if key_prefix == "origin" and st.session_state.get("origin_q") and not st.session_state.get(q_key):
         st.session_state[q_key] = st.session_state.get("origin_q", "")
     if key_prefix == "dest" and st.session_state.get("dest_q") and not st.session_state.get(q_key):
@@ -828,6 +910,7 @@ def airport_selector_block(title: str, key_prefix: str, preselected: dict | None
 
     options = results["label"].tolist()
 
+    # Preselect logic (stable)
     idx = 0
     if preselected and preselected.get("iata"):
         iata = preselected["iata"]
@@ -857,19 +940,25 @@ def airport_selector_block(title: str, key_prefix: str, preselected: dict | None
         f"**Country:** {payload['country_code'] or '-'}"
     )
 
+    with st.expander("Details (JSON)"):
+        st.json(payload)
+
     st.markdown("</div>", unsafe_allow_html=True)
     return payload
 
 
+# Swap / Clear controls (safe: only set pending action flags)
 ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
 with ctrl1:
     if st.button("🔁 Swap origin/destination", use_container_width=True):
         st.session_state["_pending_action"] = "swap"
         st.rerun()
+
 with ctrl2:
     if st.button("🧹 Clear selections", use_container_width=True):
         st.session_state["_pending_action"] = "clear"
         st.rerun()
+
 with ctrl3:
     st.caption("Tip: select both airports, then set trip details below.")
 
@@ -878,6 +967,7 @@ with colA:
     origin = airport_selector_block("Origin", "origin", st.session_state.get("origin_airport"))
     if origin:
         st.session_state["origin_airport"] = origin
+
 with colB:
     dest = airport_selector_block("Destination", "dest", st.session_state.get("dest_airport"))
     if dest:
@@ -898,227 +988,255 @@ dest_airport = st.session_state.get("dest_airport")
 if not origin_airport or not dest_airport:
     st.warning("Select both origin and destination airports to continue.")
     st.markdown("</div>", unsafe_allow_html=True)
-    st.stop()
+else:
+    # --- Trip basics
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        trip_type = st.selectbox("Trip type", ["One-way", "Return"], index=1)
+    with c2:
+        depart_date = st.date_input("Departure date", value=date.today())
+    with c3:
+        if trip_type == "Return":
+            return_date = st.date_input("Return date", value=date.today())
+        else:
+            return_date = None
+            st.caption("Return date not required for One-way.")
+    with c4:
+        cabin = st.selectbox("Cabin", ["Economy", "Premium Economy", "Business", "First"], index=0)
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    trip_type = st.selectbox("Trip type", ["One-way", "Return"], index=1)
-with c2:
-    depart_date = st.date_input("Departure date", value=date.today())
-with c3:
-    if trip_type == "Return":
-        return_date = st.date_input("Return date", value=date.today())
-    else:
-        return_date = None
-        st.caption("Return date not required for One-way.")
-with c4:
-    cabin = st.selectbox("Cabin", ["Economy", "Premium Economy", "Business", "First"], index=0)
+    # --- Preferences
+    c5, c6, c7, c8 = st.columns(4)
+    with c5:
+        passengers = st.number_input("Passengers", min_value=1, max_value=9, value=1, step=1)
+    with c6:
+        flexible = st.checkbox("Flexible dates (±3 days)", value=False)
+    with c7:
+        budget = st.text_input("Budget (optional)", placeholder="e.g., $800 max / flexible")
+    with c8:
+        airline_preference = st.text_input("Airline preference (optional)", placeholder="e.g., KLM, Virgin, Lufthansa")
 
-c5, c6, c7, c8 = st.columns(4)
-with c5:
-    pax = st.number_input("Passengers", min_value=1, max_value=9, value=1, step=1)
-with c6:
-    flexible = st.checkbox("Flexible dates (±3 days)", value=False)
-with c7:
-    budget = st.text_input("Budget (optional)", placeholder="e.g., $800 max / flexible")
-with c8:
-    airline_pref = st.text_input("Airline preference (optional)", placeholder="e.g., KLM, Virgin, Lufthansa")
-
-if trip_type == "Return" and return_date and return_date < depart_date:
-    st.error("Return date cannot be earlier than departure date.")
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.stop()
-
-# Buttons always visible (fixes “missing search button”)
-b1, b2 = st.columns([1, 1])
-do_search = b1.button("🔎 Search flights", use_container_width=True)
-do_booking = b2.button("✅ Create booking handoff", use_container_width=True)
-
-_ensure_pax_details(int(pax))
-with st.expander("Passenger details (per passenger)", expanded=False):
-    st.caption("Enter name + WhatsApp per passenger. These are included in the booking payload + PDF.")
-    for i in range(int(pax)):
-        pcol1, pcol2 = st.columns([2, 2])
-        with pcol1:
-            st.session_state["passengers_details"][i]["name"] = st.text_input(
-                f"Passenger {i+1} name",
-                value=st.session_state["passengers_details"][i].get("name", ""),
-                key=f"pax_name_{i}",
-            )
-        with pcol2:
-            st.session_state["passengers_details"][i]["whatsapp"] = st.text_input(
-                f"Passenger {i+1} WhatsApp",
-                value=st.session_state["passengers_details"][i].get("whatsapp", ""),
-                key=f"pax_wa_{i}",
-                placeholder="+234xxxxxxxxxx",
-            )
-
-notes = st.text_area("Notes / preferences (optional)", placeholder="Baggage, time preference, avoid long layovers, etc.")
-email_to = st.text_input("Email (optional)", placeholder="agent@company.com or your email")
-
-st.markdown("</div>", unsafe_allow_html=True)
-st.write("")
-
-
-# Search (mock for now)
-if do_search:
-    flex_days = 3 if flexible else 0
-    cards = mock_flight_search_results(
-        origin_iata=origin_airport["iata"],
-        dest_iata=dest_airport["iata"],
-        depart_date=depart_date,
-        pax=int(pax),
-        cabin=cabin,
-        trip_type=trip_type,
-        flex_days=flex_days,
-    )
-    st.session_state["last_search_cards"] = cards
-    st.session_state["last_search_meta"] = {
-        "origin": origin_airport,
-        "destination": dest_airport,
-        "depart_date": str(depart_date),
-        "return_date": str(return_date) if (trip_type == "Return" and return_date) else "",
-        "trip_type": trip_type,
-        "cabin": cabin,
-        "pax": int(pax),
-        "flexible": bool(flexible),
-    }
-
-cards = st.session_state.get("last_search_cards")
-meta = st.session_state.get("last_search_meta")
-
-if cards:
-    st.markdown("<div class='ow-card'>", unsafe_allow_html=True)
-    st.subheader("Flight results")
-    st.info("Showing mock results (no external API). Live booking comes next.")
-
-    for idx, r in enumerate(cards):
-        st.markdown("<div class='ow-flight'>", unsafe_allow_html=True)
-        left, mid, right = st.columns([1, 3, 1])
-        with left:
-            st.markdown(airline_logo_svg(r.get("airline_code", "XX"), style_seed=r.get("style_seed", idx)), unsafe_allow_html=True)
-        with mid:
-            st.markdown(f"**{r['airline']}**")
-            st.caption(f"{r['stops']} • {r['duration']} • {r['note']}")
-        with right:
-            st.markdown(f"### {r['price']}")
-            st.button(
-                f"Select {r['airline']}",
-                key=f"sel_{idx}_{r.get('airline_code','XX')}",
-                help="Mock selection (live booking next).",
-                use_container_width=True,
-            )
+    # Validate dates
+    if trip_type == "Return" and return_date and return_date < depart_date:
+        st.error("Return date cannot be earlier than departure date.")
         st.markdown("</div>", unsafe_allow_html=True)
+        st.stop()
+
+    # --- Buttons
+    b1, b2 = st.columns([1, 1])
+    do_search = b1.button("🔎 Search flights", use_container_width=True)
+    do_booking = b2.button("✅ Create booking handoff", use_container_width=True)
+
+    # Passenger details
+    _ensure_pax_details(int(passengers))
+    with st.expander("Passenger details (per passenger)", expanded=False):
+        st.caption("Enter name + WhatsApp per passenger. These are included in the booking payload + PDF.")
+        for i in range(int(passengers)):
+            pcol1, pcol2 = st.columns([2, 2])
+            with pcol1:
+                st.session_state["passengers_details"][i]["name"] = st.text_input(
+                    f"Passenger {i+1} name",
+                    value=st.session_state["passengers_details"][i].get("name", ""),
+                    key=f"pax_name_{i}",
+                    placeholder="e.g., Chukwuma Onunkwo",
+                )
+            with pcol2:
+                st.session_state["passengers_details"][i]["whatsapp"] = st.text_input(
+                    f"Passenger {i+1} WhatsApp",
+                    value=st.session_state["passengers_details"][i].get("whatsapp", ""),
+                    key=f"pax_wa_{i}",
+                    placeholder="+234xxxxxxxxxx",
+                )
+
+    notes = st.text_area("Notes / preferences (optional)", placeholder="Baggage, time preference, avoid long layovers, etc.")
+    contact_email = st.text_input("Email (optional)", placeholder="agent@company.com or your email")
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
 
+    # =========================
+    # Search action (persist results)
+    # =========================
+    if do_search:
+        flex_days = 3 if flexible else 0
+        cards = mock_flight_search_results(
+            origin_iata=origin_airport["iata"],
+            dest_iata=dest_airport["iata"],
+            depart_date=depart_date,
+            passengers=int(passengers),
+            cabin=cabin,
+            trip_type=trip_type,
+            flex_days=flex_days,
+        )
+        st.session_state["last_search_cards"] = cards
+        st.session_state["last_search_meta"] = {
+            "origin": origin_airport,
+            "destination": dest_airport,
+            "depart_date": str(depart_date),
+            "return_date": str(return_date) if (trip_type == "Return" and return_date) else "",
+            "trip_type": trip_type,
+            "cabin": cabin,
+            "passengers": int(passengers),
+            "flexible": bool(flexible),
+        }
 
-# Booking handoff + save
-if do_booking:
-    flex_label = "±3 days" if flexible else ""
-    pax_details = st.session_state.get("passengers_details") or []
+    # Render flight results if present
+    cards = st.session_state.get("last_search_cards")
+    meta = st.session_state.get("last_search_meta")
 
-    booking_payload = {
-        "created_at": now_utc_iso(),
-        "origin": origin_airport,
-        "destination": dest_airport,
-        "pax": int(pax),
-        "cabin": cabin,
-        "trip_type": trip_type,
-        "depart_date": str(depart_date),
-        "return_date": str(return_date) if (trip_type == "Return" and return_date) else "",
-        "flexible_dates": flex_label,
-        "passengers_details": pax_details,
-        "traveler_name": pax_details[0].get("name", "") if pax_details else "",
-        "budget": (budget or "").strip(),
-        "airline_pref": (airline_pref or "").strip(),
-        "notes": (notes or "").strip(),
-        "status": "NEW",
-    }
-
-    handoff_message = build_handoff_message(booking_payload)
-    booking_payload["handoff_message"] = handoff_message
-    st.session_state["last_booking_payload"] = booking_payload
-
-    if airtable_enabled():
-        ok, msg = save_to_airtable(booking_payload)
-        if ok:
-            st.success(msg)
+    if cards:
+        st.markdown("<div class='ow-card'>", unsafe_allow_html=True)
+        st.subheader("Flight results")
+        if meta and meta.get("flexible"):
+            st.info("Showing mock results with flexible-date estimates (±3 days). Live providers will return real variants.")
         else:
-            st.warning("Airtable configured but save failed; falling back to local file.")
-            st.code(msg)
+            st.info("Showing mock results (no external API). Live booking comes next.")
+
+        for idx, r in enumerate(cards):
+            st.markdown("<div class='ow-flight'>", unsafe_allow_html=True)
+            left, mid, right = st.columns([1, 3, 1])
+            with left:
+                st.markdown(get_airline_svg(r.get("airline_code", "XX"), fallback_seed=r.get("style_seed", idx)), unsafe_allow_html=True)
+            with mid:
+                st.markdown(f"**{r['airline']}**")
+                st.caption(f"{r['stops']} • {r['duration']} • {r['note']}")
+            with right:
+                st.markdown(f"### {r['price']}")
+                st.button(
+                    f"Select {r['airline']}",
+                    key=f"sel_{idx}_{r.get('airline_code','XX')}",
+                    help="Mock selection (live booking next).",
+                    use_container_width=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.write("")
+
+    # =========================
+    # Booking handoff + save + PDF
+    # =========================
+    if do_booking:
+        flex_label = "Yes" if flexible else "No"
+        pax_details = st.session_state.get("passengers_details") or []
+
+        booking_payload = {
+            "created_at": now_utc_iso(),
+            "origin": origin_airport,
+            "destination": dest_airport,
+
+            "passengers": int(passengers),
+            "cabin": cabin,
+            "trip_type": trip_type,
+
+            "depart_date": str(depart_date),
+            "return_date": str(return_date) if (trip_type == "Return" and return_date) else "",
+            "flexible_dates": flex_label,
+            "flex_window_days": 3 if flexible else 0,
+
+            "passengers_details": pax_details,
+            "traveler_name": pax_details[0].get("name", "") if pax_details else "",
+            "budget": (budget or "").strip(),
+            "airline_preference": (airline_preference or "").strip(),
+            "notes": (notes or "").strip(),
+            "contact_email": (contact_email or "").strip(),
+
+            "status": "NEW",
+        }
+
+        handoff_message = build_handoff_message(booking_payload)
+        booking_payload["handoff_message"] = handoff_message
+        st.session_state["last_booking_payload"] = booking_payload
+
+        # Save: Airtable if configured, else local JSONL
+        saved_msg = ""
+        if airtable_enabled():
+            ok, msg = save_to_airtable(booking_payload)
+            if ok:
+                st.success(msg)
+            else:
+                st.warning("Airtable configured but save failed; falling back to local file.")
+                st.code(msg)
+                try:
+                    append_local_jsonl(booking_payload)
+                    st.success("Saved locally as fallback.")
+                    saved_msg = f"Saved to local file: {BOOKING_STORE_PATH}"
+                except Exception as e:
+                    st.error("Local save failed.")
+                    st.code(str(e))
+        else:
             try:
                 append_local_jsonl(booking_payload)
-                st.success("Saved locally as fallback.")
+                st.success("Booking request created (stored locally).")
+                saved_msg = f"Saved to local file: {BOOKING_STORE_PATH}"
             except Exception as e:
-                st.error("Local save failed.")
+                st.error("Could not save booking request locally.")
                 st.code(str(e))
-    else:
-        try:
-            append_local_jsonl(booking_payload)
-            st.success("Booking request created (stored locally).")
-        except Exception as e:
-            st.error("Could not save booking request locally.")
-            st.code(str(e))
 
+        if saved_msg:
+            st.caption(saved_msg)
 
-# Always render last booking
-last_booking = st.session_state.get("last_booking_payload")
-if last_booking:
-    st.markdown("<div class='ow-card'>", unsafe_allow_html=True)
-    st.subheader("Booking handoff")
+    # Always render the last booking section if it exists
+    last_booking = st.session_state.get("last_booking_payload")
+    if last_booking:
+        st.markdown("<div class='ow-card'>", unsafe_allow_html=True)
+        st.subheader("Booking handoff")
 
-    o = last_booking.get("origin", {})
-    d = last_booking.get("destination", {})
-    pax_details = last_booking.get("passengers_details", []) or []
+        o = last_booking.get("origin", {})
+        d = last_booking.get("destination", {})
+        pax_details = last_booking.get("passengers_details", []) or []
 
-    st.markdown("### Booking summary")
-    st.write(
-        f"**Route:** {o.get('city','')} ({o.get('iata','')}) → {d.get('city','')} ({d.get('iata','')})\n\n"
-        f"**Trip:** {last_booking.get('trip_type','')}  •  **Cabin:** {last_booking.get('cabin','')}  •  "
-        f"**Passengers:** {last_booking.get('pax',1)}\n\n"
-        f"**Departure:** {last_booking.get('depart_date','')}  •  "
-        f"**Return:** {last_booking.get('return_date','-') or '-'}  •  "
-        f"**Flexible:** {last_booking.get('flexible_dates','-') or '-'}"
-    )
-
-    st.markdown("### Passenger details")
-    for i, pxd in enumerate(pax_details, start=1):
-        st.write(f"{i}. **{pxd.get('name','-') or '-'}** — {pxd.get('whatsapp','-') or '-'}")
-
-    st.markdown("### WhatsApp-ready message")
-    st.code(last_booking.get("handoff_message", ""))
-
-    default_phone = ""
-    if pax_details and pax_details[0].get("whatsapp"):
-        default_phone = pax_details[0].get("whatsapp", "")
-    wa_url = whatsapp_link(last_booking.get("handoff_message", ""), phone_e164=(default_phone or "").strip())
-    try:
-        st.link_button("Open WhatsApp", wa_url, use_container_width=True)
-    except Exception:
-        st.markdown(f"**Open WhatsApp:** {wa_url}")
-
-    subj = quote(f"Flight booking request: {o.get('iata','')} → {d.get('iata','')}")
-    body = quote(last_booking.get("handoff_message", ""))
-    to = (email_to or "").strip()
-    mailto = f"mailto:{to}?subject={subj}&body={body}" if to else f"mailto:?subject={subj}&body={body}"
-    try:
-        st.link_button("Open email draft", mailto, use_container_width=True)
-    except Exception:
-        st.markdown(f"**Email handoff (mailto):** {mailto}")
-
-    pdf_bytes = create_booking_pdf_bytes(last_booking)
-    if pdf_bytes:
-        fname = f"booking_{o.get('iata','')}_{d.get('iata','')}_{last_booking.get('depart_date','')}.pdf"
-        st.download_button(
-            "📄 Download booking PDF",
-            data=pdf_bytes,
-            file_name=fname,
-            mime="application/pdf",
-            use_container_width=True,
+        st.markdown("### Booking summary")
+        st.write(
+            f"**Route:** {o.get('city','')} ({o.get('iata','')}) → {d.get('city','')} ({d.get('iata','')})\n\n"
+            f"**Trip:** {last_booking.get('trip_type','')}  •  **Cabin:** {last_booking.get('cabin','')}  •  "
+            f"**Passengers:** {last_booking.get('passengers',1)}\n\n"
+            f"**Departure:** {last_booking.get('depart_date','')}  •  "
+            f"**Return:** {last_booking.get('return_date','-') or '-'}  •  "
+            f"**Flexible:** {last_booking.get('flexible_dates','-') or '-'}"
         )
-    else:
-        st.info("PDF export not available (reportlab not installed).")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("### Passenger details")
+        for i, pxd in enumerate(pax_details, start=1):
+            st.write(f"{i}. **{pxd.get('name','-') or '-'}** — {pxd.get('whatsapp','-') or '-'}")
+
+        st.markdown("### WhatsApp-ready message")
+        st.code(last_booking.get("handoff_message", ""))
+
+        # WhatsApp link: use passenger 1 whatsapp if present
+        default_phone = ""
+        if pax_details and pax_details[0].get("whatsapp"):
+            default_phone = pax_details[0].get("whatsapp", "")
+        wa_url = whatsapp_link(last_booking.get("handoff_message", ""), phone_e164=(default_phone or "").strip())
+        try:
+            st.link_button("Open WhatsApp", wa_url, use_container_width=True)
+        except Exception:
+            st.markdown(f"**Open WhatsApp:** {wa_url}")
+
+        # Email handoff
+        subj = quote(f"Flight booking request: {o.get('iata','')} → {d.get('iata','')}")
+        body = quote(last_booking.get("handoff_message", ""))
+        to = (last_booking.get("contact_email") or "").strip()
+        mailto = f"mailto:{to}?subject={subj}&body={body}" if to else f"mailto:?subject={subj}&body={body}"
+        try:
+            st.link_button("Open email draft", mailto, use_container_width=True)
+        except Exception:
+            st.markdown(f"**Email handoff (mailto):** {mailto}")
+
+        # PDF
+        pdf_bytes = create_booking_pdf_bytes(last_booking)
+        if pdf_bytes:
+            fname = f"booking_{o.get('iata','')}_{d.get('iata','')}_{last_booking.get('depart_date','')}.pdf"
+            st.download_button(
+                "📄 Download booking PDF",
+                data=pdf_bytes,
+                file_name=fname,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        else:
+            st.info("PDF export not available (reportlab not installed).")
+
+        with st.expander("Technical payload (JSON)"):
+            st.json(last_booking)
+
+        st.markdown("</div>", unsafe_allow_html=True)
